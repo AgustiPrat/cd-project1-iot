@@ -1,0 +1,11 @@
+# Store every text file with LF in the repo and check it out with LF on
+# every OS, so Windows (Agus) and Linux (Clara) see identical files and the
+# Linux containers never get CRLF scripts.
+* text=auto eol=lf
+
+# Binary files: never touch
+*.pdf binary
+*.png binary
+*.jpg binary
+*.zip binary
+*.jar binary
