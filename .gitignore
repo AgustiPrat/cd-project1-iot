@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Java / Kafka Streams
+target/
+build/
+.gradle/
+*.class
+
+# Archives and macOS leftovers from the provided material
+*.zip
+__MACOSX/
+.DS_Store
+
+# Course material (statement and planning are not part of the code)
+*.pdf
+
+# LaTeX build files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+
+# Secrets and local config
+.env
+*.env
+
+# IDEs
+.idea/
+.vscode/

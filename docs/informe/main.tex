@@ -1,0 +1,407 @@
+% Informe Project 01 - Computació Distribuïda
+% Compila amb pdflatex (per exemple a Overleaf).
+% ESTAT: esborrany parcial. Cobreix la part de la casa (sensors, gateway) i
+% l'ingestor. Les seccions marcades com a PENDENT s'han d'omplir.
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[catalan]{babel}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!40!black},
+  showstringspaces=false
+}
+
+\newcommand{\pendent}[1]{\textcolor{red}{\textbf{[PENDENT: #1]}}}
+
+\begin{document}
+
+% ---------------------------------------------------------------- Portada
+\begin{titlepage}
+  \centering
+  \vspace*{3cm}
+  {\Large Universitat de Lleida\\[0.3cm] Grau en Enginyeria Informàtica\par}
+  \vspace{1.5cm}
+  {\large Computació Distribuïda\par}
+  \vspace{1cm}
+  {\Huge\bfseries Project 01\\[0.4cm] Plataforma IoT de confort per a llars\par}
+  \vspace{2cm}
+  {\large Agustí \pendent{cognoms}\\ Clara \pendent{cognoms}\par}
+  \vfill
+  {\large \pendent{data d'entrega}\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ---------------------------------------------------------------- Objectiu
+\section{Objectiu}
+
+L'objectiu del projecte és simular una plataforma IoT que recull la
+temperatura de les habitacions de diverses llars, la processa al núvol de
+forma distribuïda i envia ordres a la bomba de calor de cada habitació per
+mantenir el confort que vol cada usuari.
+
+La simulació funciona a escala 1/60: un segon real equival a un minut simulat.
+Cada lectura d'un sensor representa, per tant, un minut de la llar.
+
+% ---------------------------------------------------------------- Arquitectura
+\section{Arquitectura general}
+
+El sistema té dues zones separades per xarxa:
+
+\begin{itemize}
+  \item \textbf{La llar} (una per usuari): els sensors de temperatura, un
+        broker MQTT local (Mosquitto) i un \emph{gateway}.
+  \item \textbf{El núvol}: un broker MQTT públic, l'\emph{ingestor}, Kafka,
+        l'aplicació Kafka Streams (pipelines P2--P8), el servei
+        d'emmagatzematge cap a InfluxDB i el servei \emph{commander}.
+\end{itemize}
+
+El flux d'una lectura és:
+\begin{center}
+\small
+sensor $\rightarrow$ Mosquitto llar $\rightarrow$ gateway $\rightarrow$
+Mosquitto núvol $\rightarrow$ ingestor $\rightarrow$ Kafka
+(\texttt{raw-readings}) $\rightarrow$ emmagatzematge $\rightarrow$ InfluxDB
+\end{center}
+I el d'una ordre, el camí invers:
+\begin{center}
+\small
+Kafka Streams (P4) $\rightarrow$ \texttt{heatpump-commands} $\rightarrow$
+commander $\rightarrow$ Mosquitto núvol $\rightarrow$ gateway $\rightarrow$
+Mosquitto llar $\rightarrow$ sensor
+\end{center}
+
+Cada llar es desplega amb el seu propi fitxer \emph{docker-compose} i el seu
+propi \texttt{--project-name}. Totes les llars i el núvol comparteixen una
+xarxa Docker externa, \texttt{global\_net}, que fa el paper d'Internet. Cada
+llar té, a més, una xarxa privada (\texttt{internal\_net}) on només hi ha els
+seus sensors, el seu broker i el seu gateway.
+
+% ---------------------------------------------------------------- Components
+\section{Descripció dels components}
+
+\subsection{Sensor de temperatura}
+
+El sensor ens ve donat i no es pot modificar. Cada segon publica una lectura
+al topic configurat a \texttt{SENSOR\_TOPIC\_DATA} amb el format:
+\begin{lstlisting}
+{"timestamp": "2026-11-25T10:00:00.000000", "value": 21.4}
+\end{lstlisting}
+El \texttt{timestamp} és el temps \emph{simulat}, en format ISO~8601 i sense
+zona horària. Quan els microsegons són zero, \texttt{isoformat()} no escriu la
+part decimal, i el parseig de la P2 ho ha de tenir en compte. Cada lectura té
+una probabilitat del 20\,\% de valer exactament 100 (aproximadament un 20\,\%
+de les lectures): són errors del sensor, que la pipeline P2 ha de filtrar i
+comptar.
+
+El sensor escolta el topic \texttt{SENSOR\_TOPIC\_STATUS} i espera missatges
+\texttt{\{"status": 1\}} (encendre) o \texttt{\{"status": 0\}} (apagar). El
+seu codi no captura l'error si rep un missatge que no és JSON: l'excepció
+atura el fil de xarxa del client MQTT, i el contenidor continua viu però deixa
+de rebre ordres i d'enviar lectures. Per això el gateway només li reenvia
+ordres que ja ha validat (secció~\ref{sec:gateway}).
+
+\subsection{Llar: fitxers docker-compose}
+
+Hem creat un fitxer per llar a partir del \emph{docker-compose} d'exemple:
+\begin{itemize}
+  \item \texttt{home1.yml}: usuari \texttt{user1}, habitacions
+        \texttt{room1}, \texttt{room2} i \texttt{living\_room}.
+  \item \texttt{home2.yml}: usuari \texttt{user2}, habitacions
+        \texttt{room1} i \texttt{office}.
+\end{itemize}
+Les dues llars tenen habitacions diferents a propòsit, per demostrar que el
+gateway no necessita cap configuració per habitació.
+
+Els canvis respecte al fitxer d'exemple són:
+\begin{itemize}
+  \item El broker de la llar \textbf{no publica cap port} a la màquina
+        amfitriona. Només hi parlen els contenidors de la mateixa llar, i així
+        poden funcionar diverses llars a la mateixa màquina sense conflictes
+        de port.
+  \item Els sensors tenen \texttt{restart: on-failure}. El sensor es tanca si
+        el broker encara no està llest quan arrenca, i \texttt{depends\_on}
+        només espera que el contenidor del broker s'hagi iniciat, no que ja
+        accepti connexions.
+  \item Mantenim la imatge \texttt{eclipse-mosquitto:1.6.12} del fitxer
+        d'exemple. Aquesta versió accepta connexions anònimes sense cap
+        configuració; la 2.x necessitaria un fitxer de configuració.
+  \item S'hi afegeix el servei \texttt{gateway}, connectat a les dues xarxes.
+\end{itemize}
+
+\subsection{Gateway}\label{sec:gateway}
+
+El gateway (\texttt{gateway/gateway.py}, Python + \texttt{paho-mqtt}) fa de
+pont entre el broker de la llar i el del núvol. Té dos clients MQTT, un per a
+cada broker, i treballa en dues direccions:
+
+\paragraph{Llar $\rightarrow$ núvol.}
+Se subscriu a \texttt{+/temperature}. El comodí \texttt{+} captura totes les
+habitacions, de manera que un sensor nou no requereix tocar el gateway. Per a
+cada missatge:
+\begin{enumerate}
+  \item Extreu l'habitació del topic (\texttt{room1/temperature}
+        $\rightarrow$ \texttt{room1}).
+  \item Si el contingut és un objecte JSON vàlid, hi afegeix els camps
+        \texttt{user} i \texttt{room}. Els camps originals del sensor
+        (\texttt{timestamp} i \texttt{value}) no es modifiquen.
+  \item Publica al núvol al topic \texttt{<user>/<room>/temperature}.
+\end{enumerate}
+
+\emph{Decisió: els missatges mal formats es reenvien, no es llencen.} La
+pipeline P1 ha de guardar les dades ``exactament tal com les ha llegit el
+sensor'', i P2 ha de comptar els errors de cada sensor. Si el gateway llencés
+els missatges incorrectes, al núvol no hi arribarien mai i no es podrien
+comptar. Com que un missatge mal format no es pot enriquir, es reenvia
+intacte. La identitat (usuari i habitació) no es perd perquè també va dins
+del topic.
+
+\paragraph{Preferències de confort (llar $\rightarrow$ núvol).}
+L'enunciat demana que el gateway també reculli les preferències de confort de
+l'usuari. L'usuari les publica al broker de casa, al topic \texttt{settings}
+(per exemple amb \texttt{mosquitto\_pub}), i el gateway les reenvia al núvol a
+\texttt{<user>/settings}. El gateway no les valida: ho fa l'ingestor, que és
+qui les escriu al topic compactat. Així la regla de validació és en un sol
+lloc.
+
+\paragraph{Núvol $\rightarrow$ llar.}
+Se subscriu a \texttt{<user>/+/heatpump}, només les ordres del seu usuari, i
+les publica al broker local a \texttt{<room>/heatpump}, que és el topic que
+escolta el sensor. Abans de reenviar una ordre, comprova que tingui
+exactament el format \texttt{\{"status": 0|1\}}. Així es protegeix el sensor,
+que no tolera missatges incorrectes.
+
+\paragraph{Robustesa.}
+\begin{itemize}
+  \item Si el broker encara no està disponible quan el gateway arrenca, ho
+        torna a provar cada 5 segons.
+  \item Les subscripcions es fan dins de \texttt{on\_connect}, de manera que
+        es restauren automàticament després d'una reconnexió.
+  \item Cada client té un \texttt{client\_id} únic
+        (\texttt{gateway-<user>-cloud}). Dos clients amb el mateix
+        identificador en un broker es desconnectarien l'un a l'altre.
+  \item Cap al núvol es publica amb QoS~1 (entrega com a mínim una vegada).
+        Això només cobreix el tram gateway $\rightarrow$ núvol: el sensor
+        publica amb QoS~0, i al tram sensor $\rightarrow$ gateway no hi ha
+        cap garantia d'entrega.
+\end{itemize}
+
+\subsection{Ingestor}
+
+L'ingestor (\texttt{cloud/ingestor/ingestor.py}, Python + \texttt{paho-mqtt}
++ \texttt{confluent-kafka}) se subscriu al broker del núvol i publica cada
+missatge a Kafka:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Topic MQTT & Topic Kafka & Clau \\
+\midrule
+\texttt{<user>/<room>/temperature} & \texttt{raw-readings} & \texttt{<user>/<room>} \\
+\texttt{<user>/settings} & \texttt{user-settings} & \texttt{<user>} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item Les lectures s'envien a \texttt{raw-readings} \textbf{sense
+        interpretar-les}: el valor és el contingut exacte que arriba. Per
+        això l'ingestor no pot fallar per culpa d'un missatge mal format,
+        perquè no el descodifica.
+  \item Els \emph{settings} sí que es validen (mode \texttt{comfort},
+        \texttt{eco} o \texttt{away}; \texttt{min} i \texttt{max} opcionals,
+        numèrics i amb $\mathit{min} < \mathit{max}$). El motiu és que
+        \texttt{user-settings} és un topic compactat que P3 llegeix com a
+        \texttt{KTable}: un valor incorrecte passaria a ser la configuració
+        ``actual'' de l'usuari.
+  \item El productor Kafka fa servir \texttt{acks=all} (la dada no es dona
+        per enviada fins que el broker l'ha guardada) i
+        \texttt{enable.idempotence=true} (els reintents no generen
+        duplicats).
+  \item \emph{Ampliacions respecte al temari.} Els dos punts següents no es
+        van veure a classe. Els hem afegit per millorar la tolerància a
+        fallades i l'escalabilitat de l'ingestor, que són requisits de
+        l'enunciat (``consider efficiency, fault tolerance and performance'').
+  \item El client MQTT fa servir una \textbf{sessió persistent}
+        (\texttt{clean\_session=False}) amb un identificador estable. Mentre
+        l'ingestor està aturat, el broker li guarda en cua els missatges
+        QoS~1 i els hi entrega quan torna.
+  \item Les subscripcions són \textbf{compartides}
+        (\texttt{\$share/ingestors/...}, suportades per Mosquitto 1.6). Si
+        s'arrenquen diversos ingestors, cada missatge el rep només un d'ells.
+        Així l'ingestor es pot escalar horitzontalment sense duplicar dades a
+        Kafka. Cada instància necessita un \texttt{client\_id} únic: per
+        defecte es fa servir el nom de la màquina.
+  \item En aturar el contenidor (\texttt{SIGTERM}), l'ingestor està pensat per
+        tancar el client MQTT i fer \texttt{flush()} del productor, per no
+        perdre missatges pendents. \pendent{verificar-ho a la prova de punta a
+        punta.}
+\end{itemize}
+
+\subsection{Elecció de la clau de Kafka}
+
+Kafka només garanteix l'ordre dels missatges \emph{dins d'una partició}, i la
+clau decideix a quina partició va cada missatge. Fem servir
+\texttt{<user>/<room>} com a clau de \texttt{raw-readings} perquè:
+\begin{itemize}
+  \item \textbf{Ordre per habitació:} totes les lectures d'una habitació van
+        a la mateixa partició i en ordre. És el que necessiten les
+        operacions amb estat per habitació: l'estat de la bomba de calor
+        (P4), el recompte d'errors per sensor (P2) i la detecció de sensor
+        mort (P7).
+  \item \textbf{Repartiment de la càrrega:} habitacions diferents es
+        reparteixen entre particions i, per tant, entre les tasques de Kafka
+        Streams. Si la clau fos només l'usuari, una llar amb moltes
+        habitacions carregaria una sola partició.
+  \item \textbf{Cost:} les agregacions per usuari (P5, P6) necessiten
+        reagrupar les dades per \texttt{<user>}. Això implica un
+        \emph{repartition topic} intern, i és un cost que acceptem a canvi
+        del paral·lelisme per habitació.
+\end{itemize}
+Els \emph{settings} tenen la clau \texttt{<user>}, perquè la configuració és
+per usuari i la compactació ha de conservar l'últim valor de cada usuari.
+
+\subsection{Convenció de topics MQTT}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Broker & Topic & Contingut \\
+\midrule
+Llar  & \texttt{<room>/temperature} & lectura del sensor \\
+Llar  & \texttt{<room>/heatpump} & ordre per al sensor \\
+Llar  & \texttt{settings} & preferències de confort de l'usuari \\
+Núvol & \texttt{<user>/<room>/temperature} & lectura + \texttt{user}, \texttt{room} \\
+Núvol & \texttt{<user>/<room>/heatpump} & ordre del commander \\
+Núvol & \texttt{<user>/settings} & preferències (reenviades pel gateway) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Emmagatzematge, Kafka Streams i commander}
+\pendent{part de la Clara: docker-compose del núvol, servei d'emmagatzematge
+i model de dades d'InfluxDB, esquelet de l'aplicació Kafka Streams.}
+
+\pendent{pipelines P2--P8 i commander.}
+
+% ---------------------------------------------------------------- Topologia
+\section{Topologia de l'aplicació Kafka Streams}
+\pendent{sortida de \texttt{Topology.describe()}: sub-topologies, state
+stores, topics interns i nombre de tasques.}
+
+% ---------------------------------------------------------------- Proves
+\section{Proves i resultats}
+
+\subsection{Proves unitàries}
+La lògica de traducció del gateway i la d'encaminament de l'ingestor estan
+separades en funcions pures (sense xarxa), i això permet provar-les sense
+cap broker. Es llancen amb \texttt{python -m unittest -v} des de cada
+carpeta:
+\begin{itemize}
+  \item \texttt{gateway/test\_gateway.py}: 12 proves (lectura vàlida
+        enriquida, valor 100 reenviat, JSON incorrecte reenviat intacte,
+        UTF-8 invàlid, reenviament de \emph{settings}, topics inesperats,
+        ordres d'un altre usuari, validació d'ordres). Resultat: 12/12
+        correctes.
+  \item \texttt{cloud/ingestor/test\_ingestor.py}: 7 proves (clau
+        \texttt{<user>/<room>}, lectura mal formada ingerida tal qual, topics
+        desconeguts descartats, validació de \emph{settings}). Resultat: 7/7
+        correctes.
+\end{itemize}
+Aquestes proves cobreixen la lògica, no la connexió amb els brokers ni amb
+Kafka. Les proves de l'ingestor substitueixen la llibreria
+\texttt{confluent-kafka} per un mòdul buit, de manera que el productor Kafka
+només es prova a la prova de punta a punta.
+
+\subsection{Prova de punta a punta}
+\pendent{executar la prova amb Docker i afegir-hi les captures:
+\texttt{mosquitto\_sub} al núvol i \texttt{kafka-console-consumer} sobre
+\texttt{raw-readings} mostrant les claus.}
+
+% ---------------------------------------------------------------- Execució
+\section{Com executar el projecte}
+
+\subsection*{Requisits}
+Docker i Docker Compose. Per a les proves unitàries, Python 3 amb
+\texttt{paho-mqtt==1.6.1}.
+
+\subsection*{Passos (part actual)}
+\begin{enumerate}
+  \item Crear la xarxa compartida (un sol cop):
+\begin{lstlisting}
+docker network create global_net
+\end{lstlisting}
+  \item Arrencar el núvol de prova (des de \texttt{cloud/}):
+\begin{lstlisting}
+docker compose -f docker-compose.test.yml --project-name cloud up --build
+\end{lstlisting}
+  \item Arrencar les llars (des de \texttt{user/user/}), cadascuna amb el seu
+        nom de projecte:
+\begin{lstlisting}
+docker compose -f home1.yml --project-name user1 up --build
+docker compose -f home2.yml --project-name user2 up --build
+\end{lstlisting}
+  \item Comprovar que les lectures arriben al broker del núvol:
+\begin{lstlisting}
+docker exec -it cloud-mosquitto_cloud-1 mosquitto_sub -t "+/+/temperature" -v
+\end{lstlisting}
+  \item Comprovar que arriben a Kafka amb la seva clau:
+\begin{lstlisting}
+docker exec -it cloud-kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic raw-readings \
+  --from-beginning --property print.key=true
+\end{lstlisting}
+  \item Publicar unes preferències des de casa de l'\texttt{user1}:
+\begin{lstlisting}
+docker exec -it user1-mosquitto-1 mosquitto_pub \
+  -t "settings" -m '{"mode": "comfort", "min": 21, "max": 24}'
+\end{lstlisting}
+  \item Enviar una ordre manual a una bomba de calor (simula el commander):
+\begin{lstlisting}
+docker exec -it cloud-mosquitto_cloud-1 mosquitto_pub \
+  -t "user1/room1/heatpump" -m '{"status": 1}'
+\end{lstlisting}
+\end{enumerate}
+
+\pendent{passos del núvol complet (InfluxDB, Grafana, Kafka Streams) i de
+minikube.}
+
+% ---------------------------------------------------------------- Conclusions
+\section{Conclusions}
+\pendent{omplir en acabar el projecte.}
+
+\section{Temps dedicat}
+\pendent{hores dedicades per cada membre.}
+
+% ---------------------------------------------------------------- Referències
+\begin{thebibliography}{9}
+\bibitem{classe} E. Gabaldon. Apunts de l'assignatura: \emph{Introduction to
+  Docker}, \emph{IoT Communication (MQTT)}, \emph{Streaming Processing
+  (Kafka)} i \emph{NoSQL Databases}. Computació Distribuïda, UdL.
+\bibitem{paho} Eclipse Paho MQTT Python Client 1.6.1.
+  \url{https://pypi.org/project/paho-mqtt/1.6.1/}
+\bibitem{mosquitto} Eclipse Mosquitto.
+  \url{https://mosquitto.org/}
+\bibitem{kafka} Apache Kafka Documentation.
+  \url{https://kafka.apache.org/documentation/}
+\bibitem{confluent} confluent-kafka-python.
+  \url{https://docs.confluent.io/kafka-clients/python/current/overview.html}
+\bibitem{compose} Docker Compose: Networking.
+  \url{https://docs.docker.com/compose/how-tos/networking/}
+\end{thebibliography}
+
+\end{document}

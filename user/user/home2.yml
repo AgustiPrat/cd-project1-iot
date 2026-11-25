@@ -1,0 +1,54 @@
+# Home of user2: local MQTT broker + 2 room sensors + gateway.
+# A different set of rooms than user1, to show that the gateway needs no
+# per-room configuration.
+#
+# Needs the shared network once:   docker network create global_net
+# Run:   docker compose -f home2.yml --project-name user2 up --build
+services:
+  mosquitto:
+    image: eclipse-mosquitto:1.6.12
+    networks:
+      - internal_net
+
+  room1:
+    build: sensor_temperature
+    environment:
+      - MQTT_HOST=mosquitto
+      - SENSOR_TOPIC_DATA=room1/temperature
+      - SENSOR_TOPIC_STATUS=room1/heatpump
+    depends_on:
+      - mosquitto
+    restart: on-failure   # the sensor exits if the broker is not ready yet
+    networks:
+      - internal_net
+
+  office:
+    build: sensor_temperature
+    environment:
+      - MQTT_HOST=mosquitto
+      - SENSOR_TOPIC_DATA=office/temperature
+      - SENSOR_TOPIC_STATUS=office/heatpump
+    depends_on:
+      - mosquitto
+    restart: on-failure
+    networks:
+      - internal_net
+
+  gateway:
+    build: gateway
+    environment:
+      - USER_ID=user2
+      - LOCAL_MQTT_HOST=mosquitto
+      - CLOUD_MQTT_HOST=mosquitto_cloud   # service name of the cloud broker on global_net
+    depends_on:
+      - mosquitto
+    restart: on-failure
+    networks:
+      - internal_net
+      - global_net
+
+networks:
+  internal_net:
+    driver: bridge
+  global_net:
+    external: true

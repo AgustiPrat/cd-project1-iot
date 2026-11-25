@@ -1,0 +1,51 @@
+# MINIMAL cloud for testing the gateway + ingestor only.
+# The real cloud compose (InfluxDB, Grafana, storage, topics...) is Clara's task;
+# when it exists, add the ingestor service to it and delete this file.
+#
+# Needs the shared network once:   docker network create global_net
+# Run:   docker compose -f docker-compose.test.yml --project-name cloud up --build
+services:
+  mosquitto_cloud:
+    image: eclipse-mosquitto:1.6.12
+    ports:
+      - "1884:1883"   # host port 1884, so it does not clash with other brokers
+    networks:
+      - global_net
+
+  kafka:
+    image: apache/kafka:3.8.0
+    environment:
+      # Single node in KRaft mode (no ZooKeeper): broker and controller in one process
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3   # auto-created topics get 3 partitions
+      # NOTE for the real cloud compose: auto-created topics are NOT compacted.
+      # user-settings must be created explicitly with cleanup.policy=compact.
+    networks:
+      - global_net
+
+  ingestor:
+    build: ingestor
+    hostname: ingestor-1   # stable MQTT client id across restarts (persistent session)
+    environment:
+      - CLOUD_MQTT_HOST=mosquitto_cloud
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    depends_on:
+      - mosquitto_cloud
+      - kafka
+    restart: on-failure
+    networks:
+      - global_net
+
+networks:
+  global_net:
+    external: true
