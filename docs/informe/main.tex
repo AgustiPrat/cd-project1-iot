@@ -328,9 +328,56 @@ Kafka. Les proves de l'ingestor substitueixen la llibreria
 només es prova a la prova de punta a punta.
 
 \subsection{Prova de punta a punta}
-\pendent{executar la prova amb Docker i afegir-hi les captures:
-\texttt{mosquitto\_sub} al núvol i \texttt{kafka-console-consumer} sobre
-\texttt{raw-readings} mostrant les claus.}
+Executada el 25/11/2026 amb Docker Desktop (motor 28.5.2), amb el núvol de
+prova i dues llars: \texttt{user1} (\texttt{room1}, \texttt{room2},
+\texttt{living\_room}) i \texttt{user2} (\texttt{room1}, \texttt{office}).
+
+\paragraph{Lectures fins a Kafka.}
+Els gateways reenvien cada lectura enriquida amb \texttt{user} i
+\texttt{room}, i l'ingestor la publica a \texttt{raw-readings}. També hi
+arriben els valors de 100 (errors del sensor), que la P2 ha de filtrar. El
+topic té 3 particions, i en llegir els 600 primers missatges amb
+\texttt{kafka-console-consumer} cada clau apareix sempre a la mateixa
+partició:
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Clau & Partició & Missatges \\
+\midrule
+\texttt{user1/living\_room} & 0 & 31 \\
+\texttt{user1/room1} & 1 & 246 \\
+\texttt{user2/office} & 1 & 77 \\
+\texttt{user1/room2} & 2 & 246 \\
+\bottomrule
+\end{tabular}
+\end{center}
+El nombre de missatges de cada clau depèn de quanta estona fa que funciona el
+sensor i de l'ordre de lectura (partició a partició). L'important és que una
+clau no apareix mai en dues particions. Dues claus poden compartir partició
+(\texttt{user1/room1} i \texttt{user2/office}), perquè la partició es calcula
+com $\mathit{hash}(\mathit{clau}) \bmod 3$.
+
+\paragraph{Ordre a la bomba de calor.}
+Publicant \texttt{\{"status": 1\}} al topic \texttt{user1/room1/heatpump}
+del broker del núvol (simulant el commander), el gateway el reenvia a
+\texttt{room1/heatpump}, i el sensor ho confirma al seu log. A partir
+d'aquell moment, la temperatura de \texttt{room1} puja de manera constant:
+13,5 $\rightarrow$ 13,9 $\rightarrow$ 14,4 $\rightarrow$ \ldots
+$\rightarrow$ 17,8\,°C en 12 lectures. Una de les lectures pel mig val 100
+(error del sensor).
+
+\paragraph{Missatges invàlids.}
+El gateway descarta les ordres que no són JSON vàlid (per exemple
+\texttt{garbage}) i ho deixa al log com a avís; el sensor no les rep.
+L'ingestor descarta uns \emph{settings} amb el mode \texttt{party}. Cap dels
+dos serveis s'atura.
+
+\paragraph{Preferències.}
+Publicant \texttt{\{"mode": "comfort", "min": 21, "max": 24\}} al topic
+\texttt{settings} del broker de casa de l'\texttt{user1}, el missatge arriba
+a Kafka, al topic \texttt{user-settings}, amb la clau \texttt{user1}.
+
+\pendent{afegir captures de pantalla de les proves.}
 
 % ---------------------------------------------------------------- Execució
 \section{Com executar el projecte}
