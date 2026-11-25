@@ -86,7 +86,7 @@ Aquesta és la part que **tots dos hem de respectar** perquè les peces encaixin
 | cloud | `<user>/<room>/temperature` | gateway → ingestor | lectura + `"user"` i `"room"` |
 | cloud | `<user>/settings` | gateway → ingestor | settings tal com arriben |
 | cloud | `<user>/<room>/heatpump` | commander → gateway | `{"status": 0\|1}` (fixat al codi del gateway) |
-| cloud | `<user>/alerts` | commander → gateway | alerta en JSON 📝 · ⬜ el gateway encara no s'hi subscriu (l'enunciat demana que les alertes arribin a casa) |
+| cloud | `<user>/alerts` | commander → gateway | alerta en JSON (format a `decisions.md` §5) · ⬜ el gateway encara no s'hi subscriu (l'enunciat demana que les alertes arribin a casa) |
 
 El format de `settings` surt de l'exemple de l'enunciat (P3).
 
@@ -99,12 +99,13 @@ Tots els topics tenen **3 particions**. La **clau** decideix la partició: `hash
 | `raw-readings` | `<user>/<room>` | lectura tal com arriba (també les mal formades) | ingestor | P2, storage | ✅ provat de punta a punta (mal formades: només test unitari) |
 | `user-settings` | `<user>` | `{"mode", "min"?, "max"?}` | ingestor | P3 (KTable) | ✅ arriben amb clau `<user>` · ⬜ **compactat** (#1) |
 | `clean-readings` | `<user>/<room>` | lectura sense els valors de 100 | P2 | P4, P5, P6, P7, storage | |
-| `sensor-health` 📝 | `<user>/<room>` | errors per dia simulat | P2 | P7, storage | |
-| `heatpump-commands` | `<user>/<room>` | `{"status": 0\|1}` | P4 | commander, P6 | 📝 format Kafka a pactar a #7 |
+| `sensor-health` | `<user>/<room>` | `{"day", "errors", "total", "error_ratio"}` | P2 | P7, storage | |
+| `heatpump-commands` | `<user>/<room>` | `{"status": 0\|1}` | P4 | commander, P6 (KTable) | |
 | `home-stats` | `<user>` | mitjana/mín/màx per hora simulada | P5 | storage | |
 | `energy-bill` | `<user>` | minuts encesa, kWh i € per dia simulat | P6 | P8, storage | |
-| `alerts` | `<user>` | tipus + habitació + detall | P2/P7 | commander, storage | 📝 #7 |
-| `leaderboard` | una clau única 📝 | rànquing per cost i per confort | P8 | storage | |
+| `daily-comfort` | `<user>` | % de minuts dins del rang per dia simulat | P6 | P8, storage | |
+| `alerts` | `<user>` | tipus + habitació + detall (`decisions.md` §5) | P7 | commander, storage | |
+| `leaderboard` | `"all"` (clau fixa) | rànquing per cost i per confort | P8 | storage | |
 
 ### 4.3 Per què aquestes claus
 
@@ -129,15 +130,16 @@ flowchart TB
   P4 --> CMDS[heatpump-commands]
   CLEAN --> P5[P5 Home stats<br/>finestra 1 h sim]
   P5 --> STATS[home-stats]
-  CMDS --> P6[P6 Energy bill<br/>state store + finestra 1 dia sim]
+  CMDS --> P6[P6 Energy bill<br/>KTable + finestra 1 dia sim]
   CLEAN --> P6
+  P3 --> P6
   P6 --> BILL[energy-bill]
+  P6 --> COMF[daily-comfort]
   CLEAN --> P7[P7 Alerts]
   HEALTH --> P7
   P7 --> ALERTS[alerts]
   BILL --> P8[P8 Leaderboard]
-  CLEAN --> P8
-  P3 --> P8
+  COMF --> P8
   P8 --> LB[leaderboard]
 ```
 
@@ -145,12 +147,12 @@ flowchart TB
 |---|---|---|---|---|---|
 | **P1** Save raw | `raw-readings` | La guarda tal qual a InfluxDB (la fa l'storage, sense Streams) | InfluxDB | — | Clara |
 | **P2** Clean & health | `raw-readings` | Llença els valors d'exactament 100 i els missatges mal formats **sense parar l'app**; compta els errors per sensor i per dia simulat | `clean-readings`, `sensor-health` | finestra d'1 dia simulat (event time) | Agus |
-| **P3** Settings | `user-settings` | KTable amb els últims settings de cada usuari. Modes: comfort (per defecte 20–25), eco 17–20, away = bomba apagada excepte si la temperatura < 12 °C | (KTable interna) | KTable | Clara |
+| **P3** Settings | `user-settings` | KTable amb els últims settings de cada usuari. Modes: comfort (per defecte 20–25, rang propi permès), eco sempre 17–20, away = s'encén < 12 °C i s'apaga > 14 °C | (KTable interna) | KTable | Clara |
 | **P4** Actuate | `clean-readings` + P3 | Canvia la clau a `user` → **leftJoin** (un usuari sense settings fa servir comfort 20–25) → decideix on/off. **Només emet quan l'estat canvia**. Un canvi de mode s'aplica a la lectura següent, sense reiniciar res | `heatpump-commands` | store on/off per `user/room` | Clara |
 | **P5** Home stats | `clean-readings` | Canvia la clau a `user` i calcula mitjana, mín i màx de tota la casa | `home-stats` | finestra d'1 hora simulada (event time) | Agus |
-| **P6** Energy bill | `heatpump-commands` + `clean-readings` | Desa a un state store l'últim estat de cada bomba (les ordres només arriben quan canvia) i compta 1 minut encès per cada lectura amb la bomba encesa → × 2 kW → kWh → € segons la franja horària simulada | `energy-bill` | store d'estat per `user/room` + finestra d'1 dia simulat | Agus |
-| **P7** Alerts | `raw-readings` (sensor mort), `clean-readings` (fora de rang), `sensor-health` | Sensor mort (> 1 min real sense cap missatge: un sensor que envia 100 no està mort), fora de rang (< 12 o > 30), necessita manteniment | `alerts` | darrer missatge per habitació + punctuator `WALL_CLOCK_TIME` (si el sensor calla, l'event time no avança) | Agus |
-| **P8** Leaderboard | `energy-bill`, `clean-readings` + settings (P3) | Rànquing diari per cost i per % de minuts dins del rang de confort (cal el min/max de cada usuari) | `leaderboard` | ajunta **tots** els usuaris en una sola clau → coll d'ampolla d'escalabilitat (s'ha d'explicar a l'informe) | Clara |
+| **P6** Energy bill + confort | `clean-readings` ⨝ KTable(`heatpump-commands`) + settings | Cada lectura amb la bomba encesa compta 1 minut → × 2 kW → kWh → € segons la franja horària simulada. També compta els minuts dins del rang de confort | `energy-bill`, `daily-comfort` | KTable per `user/room` (co-particionada) + finestra d'1 dia simulat | Agus |
+| **P7** Alerts | `raw-readings` (sensor mort), `clean-readings` (fora de rang), `sensor-health` | Sensor mort (> 1 min real sense cap missatge: un sensor que envia 100 no està mort), fora de rang (< 12 o > 30), necessita manteniment (`error_ratio` > 30%) | `alerts` | darrer missatge per habitació + punctuator `WALL_CLOCK_TIME` (si el sensor calla, l'event time no avança) | Agus |
+| **P8** Leaderboard | `energy-bill`, `daily-comfort` | Rànquing diari per cost i per % de minuts dins del rang de confort (el % ja el calcula la P6) | `leaderboard` | ajunta **tots** els usuaris en una sola clau → coll d'ampolla d'escalabilitat (s'ha d'explicar a l'informe) | Clara |
 
 **Temps:** les finestres fan servir l'**event time** del `timestamp` del JSON, que es llegeix amb un `TimestampExtractor` propi. Aquest `timestamp` **ja és temps simulat**: el sensor calcula `inici + (ara − inici) × 60`. Per tant, les finestres es defineixen en temps simulat (1 h, 1 dia), no en minuts reals. Cal tenir en compte:
 - Quan els microsegons són 0, el `timestamp` ve **sense decimals**.
@@ -199,4 +201,5 @@ Comprovacions:
 - **Després de cada merge:** `git pull origin main` a la teva branca.
 - **Finals de línia:** el `.gitattributes` obliga a fer servir LF a tots dos sistemes (Windows i Linux).
 - **Contractes:** qualsevol canvi a la secció 4 es pacta abans en un issue.
-- **Tasques:** a GitHub Issues. Les de la Clara són #1–#6; el format de `heatpump-commands` i `alerts` es pacta a #7.
+- **Tasques:** a GitHub Issues. Les de la Clara són #1–#6.
+- **Llindars i decisions pactades:** [`decisions.md`](decisions.md).
