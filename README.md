@@ -9,6 +9,9 @@ sensor -> home Mosquitto -> gateway -> cloud Mosquitto -> ingestor -> Kafka -> K
                                                                           \-> storage -> InfluxDB
 ```
 
+Full architecture (components, topics, keys, pipelines P1-P8, who does what):
+[`docs/arquitectura.md`](docs/arquitectura.md) (Catalan).
+
 ## Structure
 
 | Path | What it is | Owner |
